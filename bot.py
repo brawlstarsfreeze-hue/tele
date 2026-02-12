@@ -6,13 +6,19 @@ from datetime import datetime
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN, ADMIN_IDS, ADMIN_USERNAME, DB_PATH
 
 
+# ----------------- DB -----------------
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
@@ -104,7 +110,7 @@ def money(uah: int) -> str:
 
 def parse_variants(text: str) -> list[str]:
     t = text.strip()
-    if t == "-" or t == "":
+    if t in ("-", ""):
         return []
     parts = re.split(r"[,; ]+", t)
     variants = [p.strip() for p in parts if p.strip()]
@@ -144,7 +150,9 @@ def back_home_kb() -> InlineKeyboardMarkup:
 
 
 async def safe_edit_text(c: CallbackQuery, text: str, reply_markup=None):
-    # щоб не падало, якщо повідомлення було фото/без тексту
+    """
+    Не падає, якщо повідомлення було фото/без тексту.
+    """
     try:
         if c.message and c.message.text is not None:
             await c.message.edit_text(text, reply_markup=reply_markup)
@@ -152,6 +160,19 @@ async def safe_edit_text(c: CallbackQuery, text: str, reply_markup=None):
             await c.message.answer(text, reply_markup=reply_markup)
     except Exception:
         await c.message.answer(text, reply_markup=reply_markup)
+
+
+async def send_photo_or_document(m: Message, file_id: str, caption: str, reply_markup=None):
+    """
+    Фікс "unsupported file type":
+    - пробуємо відправити як фото
+    - якщо Telegram відмовив — відправляємо як документ
+    """
+    try:
+        await m.answer_photo(photo=file_id, caption=caption, reply_markup=reply_markup)
+    except Exception as e:
+        print(f"⚠️ answer_photo failed, fallback to document: {e}")
+        await m.answer_document(document=file_id, caption=caption, reply_markup=reply_markup)
 
 
 # ----------------- FSM -----------------
@@ -244,7 +265,7 @@ async def send_product_card(chat_msg: Message, prod):
     if variants:
         cap += "\n\n📏 Розміри/варіанти: " + ", ".join(variants)
 
-    await chat_msg.answer_photo(photo=photo_id, caption=cap, reply_markup=kb)
+    await send_photo_or_document(chat_msg, photo_id, cap, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("cat:"))
@@ -460,6 +481,17 @@ async def cart_del(c: CallbackQuery):
 
 
 # ----------------- Checkout -----------------
+class Checkout(StatesGroup):
+    full_name = State()
+    phone = State()
+    city = State()
+    np_type = State()
+    np_point = State()
+    payment = State()
+    comment = State()
+    confirm = State()
+
+
 @router.callback_query(F.data == "checkout:start")
 async def checkout_start(c: CallbackQuery, state: FSMContext):
     items = await cart_items(c.from_user.id)
@@ -593,7 +625,6 @@ async def checkout_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
     username = c.from_user.username or ""
     np_type_text = "Відділення" if data["np_type"] == "branch" else "Поштомат"
 
-    # зберегти order
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             INSERT INTO orders(user_id, username, full_name, phone, city, np_type, np_point, payment, comment, total, created_at)
@@ -613,7 +644,6 @@ async def checkout_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
         await db.execute("DELETE FROM cart WHERE user_id=?", (c.from_user.id,))
         await db.commit()
 
-    # текст адміну (ЗВИЧАЙНИЙ, БЕЗ Markdown)
     lines = []
     for pid, title, price, qty, variant in items:
         vtxt = f" ({variant})" if variant else ""
@@ -633,7 +663,6 @@ async def checkout_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
     if username:
         admin_text += f"\n👤 Telegram: @{username}"
 
-    # відправка адміну
     sent = False
     for admin_id in ADMIN_IDS:
         if admin_id and admin_id != 0:
@@ -645,7 +674,6 @@ async def checkout_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
             except Exception as e:
                 print(f"❌ Failed to send to admin_id={admin_id}: {e}")
 
-    # fallback у чат, де натиснули підтвердження
     if not sent:
         try:
             await bot.send_message(c.message.chat.id, admin_text)
@@ -675,21 +703,32 @@ async def admin_add_start(c: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await state.set_state(AddProduct.photo)
-    await c.message.answer("➕ Надішли фото товару:")
+    await c.message.answer("➕ Надішли фото товару (можна як Фото або як Файл):")
     await c.answer()
 
 
-@router.message(AddProduct.photo, F.photo)
-async def admin_add_photo(m: Message, state: FSMContext):
-    photo_id = m.photo[-1].file_id
-    await state.update_data(photo_file_id=photo_id)
-    await state.set_state(AddProduct.title)
-    await m.answer("Введи назву товару:")
-
-
+# ✅ ВИПРАВЛЕНО: приймає і Photo і Document(image/*)
 @router.message(AddProduct.photo)
-async def admin_add_photo_invalid(m: Message):
-    await m.answer("❗️Потрібно надіслати саме фото.")
+async def admin_add_photo_any(m: Message, state: FSMContext):
+    # 1) якщо надіслали як фото
+    if m.photo:
+        photo_id = m.photo[-1].file_id
+        await state.update_data(photo_file_id=photo_id)
+        await state.set_state(AddProduct.title)
+        await m.answer("Введи назву товару:")
+        return
+
+    # 2) якщо надіслали як файл (document)
+    if m.document:
+        mt = (m.document.mime_type or "").lower()
+        if mt.startswith("image/"):
+            file_id = m.document.file_id
+            await state.update_data(photo_file_id=file_id)
+            await state.set_state(AddProduct.title)
+            await m.answer("Введи назву товару:")
+            return
+
+    await m.answer("❗️Надішли картинку як Фото або як Файл-зображення (jpg/png).")
 
 
 @router.message(AddProduct.title)
@@ -804,13 +843,29 @@ async def admin_del(c: CallbackQuery):
 
 
 # ----------------- Main -----------------
+async def start_polling_with_retries(dp: Dispatcher, bot: Bot):
+    delay = 3
+    while True:
+        try:
+            await dp.start_polling(bot)
+        except Exception as e:
+            print(f"❌ Polling crashed: {e}")
+            print(f"⏳ Retry in {delay}s...")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
 async def main():
     await db_init()
-    bot = Bot(token=BOT_TOKEN)
+
+    session = AiohttpSession(timeout=60)
+    bot = Bot(token=BOT_TOKEN, session=session, default=DefaultBotProperties())
+
     dp = Dispatcher()
     dp.include_router(router)
+
     print("✅ Bot started")
-    await dp.start_polling(bot)
+    await start_polling_with_retries(dp, bot)
 
 
 if __name__ == "__main__":
